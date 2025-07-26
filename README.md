@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python Version](https://img.shields.io/badge/Python-3.7%2B-yellow.svg)](https://www.python.org/)
 
-Automated analysis of Engineered Heart Tissue (EHT) thickness from video recordings using red fiducial marker detection and intensity profiling.
+Automated analysis of Engineered Heart Tissue (EHT) thickness from DINAQUBE videos using red fiducial marker detection and intensity profiling.
 
 ## Features
 
