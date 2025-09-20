@@ -8,18 +8,33 @@ import math
 # ======================
 # Parameter (anpassen)
 # ======================
-FOLDER_PATH = r"C:\Users\Moritz\Downloads\EHT_mat.8\EHT_mat.8"  # <-- Pfad anpassen
-THRESHOLD = 40            # Grauwert-Schwelle fürs Gewebe
-SEARCH_RANGE = 90         # Pixel halbseitig entlang der Senkrechten
-PROFILE_FRACTION = 0.7    # Anteil der Marker-Distanz für Profillänge
-NUM_SAMPLES = 300         # Abtastpunkte entlang der Senkrechten
-MAX_SECONDS = 5           # Wie viele Sekunden pro Video analysieren
-MIN_MARKER_RADIUS = 4     # Marker-Filter (äquivalenter Radius aus Konturfläche)
+FOLDER_PATH = r"C:\Users\Moritz\Downloads\EHT_Maturation.10\EHT_Maturation.10" # <-- Pfad anpassen
+THRESHOLD = 40             # Grauwert-Schwelle fürs Gewebe
+SEARCH_RANGE = 90          # Pixel halbseitig entlang der Senkrechten
+PROFILE_FRACTION = 0.7     # Anteil der Marker-Distanz für Profillänge (für Dicke)
+NUM_SAMPLES = 300          # Abtastpunkte entlang der Senkrechten
+MAX_SECONDS = 5            # Wie viele Sekunden pro Video analysieren
+MIN_MARKER_RADIUS = 4      # Marker-Filter (äquivalenter Radius aus Konturfläche)
 MAX_MARKER_RADIUS = 60
+
+# --- Kalibrierung: Pixel → Millimeter ---
+# Annahme aus deinem Datensatz: 150 px = 3.0 mm  ⇒  1 px = 0.02 mm
+CALIB_PX = 150.0
+CALIB_MM = 3.0
+MM_PER_PX = CALIB_MM / CALIB_PX  # = 0.02 mm/px
+
+# Format für Overlay (z.B. 2 Nachkommastellen in mm)
+MM_DECIMALS = 2
 
 # ======================
 # Hilfsfunktionen
 # ======================
+
+def px_to_mm(val_px: float | int | None) -> float | None:
+    if val_px is None:
+        return None
+    return float(val_px) * MM_PER_PX
+
 
 def detect_red_markers(img_bgr):
     """
@@ -68,22 +83,26 @@ def detect_red_markers(img_bgr):
     return pair  # ((x1,y1),(x2,y2))
 
 
-def find_eht_thickness_from_image(img_bgr, threshold=80, search_range=80, profile_fraction=0.7, num_samples=300):
+def find_eht_thickness_and_length_from_image(img_bgr, threshold=80, search_range=80, profile_fraction=0.7, num_samples=300):
     """
-    Misst EHT-Dicke (in Pixeln) senkrecht zur Markerachse.
-    Zeichnet einen Messstrich exakt in EHT-Länge und schreibt die Dicke oben links.
-    Rückgabe: (thickness_px:int|None, overlay_bgr:np.ndarray|None)
+    Misst EHT-Dicke (in Pixeln) senkrecht zur Markerachse und berechnet zusätzlich die EHT-Länge
+    (Marker-zu-Marker-Distanz in Pixeln).
+    Zeichnet Messstrich(e) und schreibt Dicke & Länge inkl. mm-Umrechnung ins Overlay.
+    Rückgabe: (thickness_px:int|None, length_px:int|None, overlay_bgr:np.ndarray|None)
     """
     # --- Marker finden ---
     markers = detect_red_markers(img_bgr)
     if markers is None:
-        return None, None
+        return None, None, None
     (x1, y1), (x2, y2) = markers
 
     dx, dy = (x2 - x1), (y2 - y1)
     axis_len = float(np.hypot(dx, dy))
     if axis_len < 1:
-        return None, None
+        return None, None, None
+
+    # EHT-Länge als Marker-zu-Marker-Distanz (Pixel)
+    eht_length_px = int(round(axis_len))
 
     # Senkrechte (Einheitsvektor) und Mitte
     perp = np.array([-dy / axis_len, dx / axis_len], dtype=float)
@@ -109,7 +128,7 @@ def find_eht_thickness_from_image(img_bgr, threshold=80, search_range=80, profil
             return 0, None, None
         return best_len, best_s, best_s + best_len  # [start, end)
 
-    # Suche über Verschiebungen: merke beste Stelle + exakte Endpunkte
+    # Suche über Verschiebungen: merke beste Stelle + exakte Endpunkte (für Dicke)
     best = dict(len=0, cx=None, cy=None, y0=None, s=None, e=None)
     for shift in np.linspace(-search_range, search_range, num_samples):
         cx = center[0] + perp[0] * shift
@@ -128,19 +147,6 @@ def find_eht_thickness_from_image(img_bgr, threshold=80, search_range=80, profil
                         y0=float(y0), s=int(s) if s is not None else None,
                         e=int(e) if e is not None else None)
 
-    if best["len"] <= 0 or best["s"] is None:
-        return None, None
-
-    # Endpunkte im Bildraum (clippen)
-    x = int(round(best["cx"]))
-    y_start = int(round(best["y0"] + best["s"]))
-    y_end   = int(round(best["y0"] + best["e"] - 1))
-    h = gray.shape[0]
-    y_start = int(np.clip(y_start, 0, h - 1))
-    y_end   = int(np.clip(y_end,   0, h - 1))
-
-    thickness = best["len"]
-
     # --- Overlay zeichnen ---
     overlay = img_bgr.copy()
     # Marker + Marker-Achse
@@ -148,24 +154,42 @@ def find_eht_thickness_from_image(img_bgr, threshold=80, search_range=80, profil
     cv2.circle(overlay, (x2, y2), 6, (0, 255, 0), 2)
     cv2.line(overlay, (x1, y1), (x2, y2), (0, 200, 0), 2)
 
-    # Messstrich NUR über das EHT (BGR: (255,0,0) = Blau)
-    cv2.line(overlay, (x, y_start), (x, y_end), (255, 0, 0), 2)
+    thickness = None
+    if best["len"] > 0 and best["s"] is not None:
+        x = int(round(best["cx"]))
+        y_start = int(round(best["y0"] + best["s"]))
+        y_end   = int(round(best["y0"] + best["e"] - 1))
+        h = gray.shape[0]
+        y_start = int(np.clip(y_start, 0, h - 1))
+        y_end   = int(np.clip(y_end,   0, h - 1))
 
-    # Text oben links
-    cv2.putText(overlay, f"thickness={thickness} px", (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        thickness = int(best["len"])
+        # Messstrich NUR über das EHT (BGR: (255,0,0) = Blau)
+        cv2.line(overlay, (x, y_start), (x, y_end), (255, 0, 0), 2)
 
-    return thickness, overlay
+    # --- Text oben links (nur mm) ---
+    len_mm = px_to_mm(eht_length_px)
+    if thickness is None:
+        cv2.putText(overlay, f"length={len_mm:.{MM_DECIMALS}f} mm", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+    else:
+        thick_mm = px_to_mm(thickness)
+        cv2.putText(overlay, f"thickness={thick_mm:.{MM_DECIMALS}f} mm", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(overlay, f"length={len_mm:.{MM_DECIMALS}f} mm", (10, 55),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+
+    return thickness, eht_length_px, overlay
 
 
 def analyze_video(video_path, threshold=80, search_range=80, profile_fraction=0.7, num_samples=300, max_seconds=7):
     """
-    Durchläuft ein Video, misst pro Frame die Dicke und merkt sich min/max inkl. Overlay.
-    Rückgabe: (min_thick:int|None, max_thick:int|None, min_file:str|None, max_file:str|None)
+    Durchläuft ein Video, misst pro Frame die Dicke (min/max + Overlays) und ermittelt die Median-Länge.
+    Rückgabe: (min_thick_px:int|None, max_thick_px:int|None, median_len_px:int|None, min_file:str|None, max_file:str|None)
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return None, None, None, None
+        return None, None, None, None, None
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps is None or fps <= 0:
@@ -175,6 +199,7 @@ def analyze_video(video_path, threshold=80, search_range=80, profile_fraction=0.
     base = os.path.splitext(os.path.basename(video_path))[0]
     min_thick, max_thick = None, None
     min_frame_file, max_frame_file = None, None
+    lengths = []
 
     frame_idx = 0
     while cap.isOpened() and frame_idx < max_frames:
@@ -182,31 +207,40 @@ def analyze_video(video_path, threshold=80, search_range=80, profile_fraction=0.
         if not ret:
             break
 
-        thickness, overlay = find_eht_thickness_from_image(
+        thickness, length_px, overlay = find_eht_thickness_and_length_from_image(
             frame, threshold=threshold, search_range=search_range,
             profile_fraction=profile_fraction, num_samples=num_samples
         )
 
+        # Länge sammeln, wenn Marker gefunden
+        if length_px is not None:
+            lengths.append(int(length_px))
+
+        # Dicke: min/max + Overlays schreiben
         if thickness is not None:
             if (min_thick is None) or (thickness < min_thick):
-                min_thick = thickness
+                min_thick = int(thickness)
                 min_frame_file = f"{base}_min_overlay.png"
                 cv2.imwrite(min_frame_file, overlay if overlay is not None else frame)
             if (max_thick is None) or (thickness > max_thick):
-                max_thick = thickness
+                max_thick = int(thickness)
                 max_frame_file = f"{base}_max_overlay.png"
                 cv2.imwrite(max_frame_file, overlay if overlay is not None else frame)
 
         frame_idx += 1
 
     cap.release()
-    return min_thick, max_thick, min_frame_file, max_frame_file
+
+    median_len = int(np.median(lengths)) if len(lengths) > 0 else None
+    return min_thick, max_thick, median_len, min_frame_file, max_frame_file
 
 
 # ======================
 # Main
 # ======================
 if __name__ == "__main__":
+    print(f"Kalibrierung: {CALIB_PX:.0f} px = {CALIB_MM:.3f} mm  (=> {MM_PER_PX:.5f} mm/px)")
+
     folder_path = FOLDER_PATH
     video_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path)
                    if f.lower().endswith(('.avi', '.mp4', '.mov', '.mkv'))]
@@ -214,7 +248,7 @@ if __name__ == "__main__":
     results = []
     for video in video_files:
         print(f"Analysiere {video} ...")
-        min_t, max_t, min_file, max_file = analyze_video(
+        min_t_px, max_t_px, median_len_px, min_file, max_file = analyze_video(
             video_path=video,
             threshold=THRESHOLD,
             search_range=SEARCH_RANGE,
@@ -222,20 +256,31 @@ if __name__ == "__main__":
             num_samples=NUM_SAMPLES,
             max_seconds=MAX_SECONDS
         )
+
+        # px → mm umrechnen
+        min_t_mm = px_to_mm(min_t_px)
+        max_t_mm = px_to_mm(max_t_px)
+        median_len_mm = px_to_mm(median_len_px)
+
         results.append([
             os.path.basename(video),
-            "" if min_t is None else int(min_t),
-            "" if max_t is None else int(max_t),
+            "" if median_len_mm is None else round(median_len_mm, 3),
+            "" if min_t_mm is None else round(min_t_mm, 3),
+            "" if max_t_mm is None else round(max_t_mm, 3),
             min_file or "",
             max_file or ""
         ])
 
-    # CSV speichern
-    with open('EHT_analysis_results.csv', 'w', newline='') as csvfile:
+    # CSV speichern (mit zusätzlichen mm-Spalten)
+    with open('EHT_analysis_results_mm.csv', 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(['Video', 'Min_Thickness_px', 'Max_Thickness_px', 'Min_Frame', 'Max_Frame'])
+        writer.writerow([
+            'Video',
+            'Median_Length_mm',
+            'Min_Thickness_mm',
+            'Max_Thickness_mm',
+            'Min_Frame', 'Max_Frame'
+        ])
         writer.writerows(results)
 
-    print("Fertig. Ergebnisse in 'EHT_analysis_results.csv'. Overlays als *_min_overlay.png / *_max_overlay.png gespeichert.")
-
-
+    print("Fertig. Ergebnisse in 'EHT_analysis_results_mm.csv'. Overlays zeigen nur mm.")
