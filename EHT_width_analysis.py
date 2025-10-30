@@ -8,7 +8,7 @@ import math
 # ======================
 # Parameter (anpassen)
 # ======================
-FOLDER_PATH = r"C:\Users\Moritz\Downloads\EHT_Maturation.10\EHT_Maturation.10" # <-- Pfad anpassen
+FOLDER_PATH = r"C:\Users\Moritz\Downloads\EHT_Maturation.10\EHT_Maturation.10"  # <-- Pfad anpassen
 THRESHOLD = 40             # Grauwert-Schwelle fürs Gewebe
 SEARCH_RANGE = 90          # Pixel halbseitig entlang der Senkrechten
 PROFILE_FRACTION = 0.7     # Anteil der Marker-Distanz für Profillänge (für Dicke)
@@ -16,6 +16,10 @@ NUM_SAMPLES = 300          # Abtastpunkte entlang der Senkrechten
 MAX_SECONDS = 5            # Wie viele Sekunden pro Video analysieren
 MIN_MARKER_RADIUS = 4      # Marker-Filter (äquivalenter Radius aus Konturfläche)
 MAX_MARKER_RADIUS = 60
+
+# Ausgabeordner
+OUTPUT_DIR = r"output"  # wohin CSV & Overlays geschrieben werden (wird automatisch angelegt)
+PER_VIDEO_SUBFOLDER = True  # pro Video ein Unterordner anlegen (\"<videoname>\")
 
 # --- Kalibrierung: Pixel → Millimeter ---
 # Annahme aus deinem Datensatz: 150 px = 3.0 mm  ⇒  1 px = 0.02 mm
@@ -83,9 +87,28 @@ def detect_red_markers(img_bgr):
     return pair  # ((x1,y1),(x2,y2))
 
 
+def _sample_profile_along_dir(gray, cx, cy, dir_vec, length, n_samples):
+    """
+    Grauwerte entlang einer Richtung dir_vec um (cx, cy) abtasten.
+    t ∈ [-length/2, +length/2], bilinear via cv2.remap.
+    """
+    d = np.asarray(dir_vec, dtype=np.float32)
+    d = d / (np.linalg.norm(d) + 1e-8)
+
+    ts = np.linspace(-0.5*length, 0.5*length, int(n_samples)).astype(np.float32)
+    xs = (cx + d[0]*ts).astype(np.float32)
+    ys = (cy + d[1]*ts).astype(np.float32)
+
+    map_x = xs.reshape(1, -1)
+    map_y = ys.reshape(1, -1)
+    prof = cv2.remap(gray, map_x, map_y, interpolation=cv2.INTER_LINEAR,
+                     borderMode=cv2.BORDER_REFLECT_101)
+    return prof.flatten()
+
+
 def find_eht_thickness_and_length_from_image(img_bgr, threshold=80, search_range=80, profile_fraction=0.7, num_samples=300):
     """
-    Misst EHT-Dicke (in Pixeln) senkrecht zur Markerachse und berechnet zusätzlich die EHT-Länge
+    Misst EHT-Dicke (in Pixeln) orthogonal zur Markerachse (globale Orthogonale) und berechnet zusätzlich die EHT-Länge
     (Marker-zu-Marker-Distanz in Pixeln).
     Zeichnet Messstrich(e) und schreibt Dicke & Länge inkl. mm-Umrechnung ins Overlay.
     Rückgabe: (thickness_px:int|None, length_px:int|None, overlay_bgr:np.ndarray|None)
@@ -104,14 +127,14 @@ def find_eht_thickness_and_length_from_image(img_bgr, threshold=80, search_range
     # EHT-Länge als Marker-zu-Marker-Distanz (Pixel)
     eht_length_px = int(round(axis_len))
 
-    # Senkrechte (Einheitsvektor) und Mitte
+    # Orthogonale (Einheitsvektor) und Mitte
     perp = np.array([-dy / axis_len, dx / axis_len], dtype=float)
     center = np.array([(x1 + x2) / 2.0, (y1 + y2) / 2.0], dtype=float)
     profile_len = int(max(5, axis_len * profile_fraction))
 
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-    # längste True-Sequenz inkl. Indizes
+    # längste True-Sequenz inkl. Indizes (lokal)
     def longest_true_run_with_idx(bw):
         best_len, best_s, cur_s = 0, None, None
         cur_len = 0
@@ -128,44 +151,60 @@ def find_eht_thickness_and_length_from_image(img_bgr, threshold=80, search_range
             return 0, None, None
         return best_len, best_s, best_s + best_len  # [start, end)
 
-    # Suche über Verschiebungen: merke beste Stelle + exakte Endpunkte (für Dicke)
-    best = dict(len=0, cx=None, cy=None, y0=None, s=None, e=None)
+    # --- Suche über Verschiebungen entlang der Orthogonalen ---
+    best = dict(len=0, cx=None, cy=None, s=None, e=None)
     for shift in np.linspace(-search_range, search_range, num_samples):
         cx = center[0] + perp[0] * shift
         cy = center[1] + perp[1] * shift
         if not (0 <= cx < gray.shape[1] and 0 <= cy < gray.shape[0]):
             continue
 
-        patch = cv2.getRectSubPix(gray, (1, profile_len), (float(cx), float(cy)))
-        arr = patch.flatten()
-        bw = arr > threshold
+        # Profil entlang der festen Orthogonalen (perp)
+        arr = _sample_profile_along_dir(
+            gray,
+            float(cx), float(cy),
+            perp,                  # Orthogonal zur Markerlinie
+            profile_len,
+            profile_len            # gleich viele Samples wie Länge
+        )
 
+        bw = arr > threshold
         run_len, s, e = longest_true_run_with_idx(bw)
         if run_len > best["len"]:
-            y0 = cy - (profile_len - 1) / 2.0  # oberer Index des Profils im Bild
             best.update(len=int(run_len), cx=float(cx), cy=float(cy),
-                        y0=float(y0), s=int(s) if s is not None else None,
+                        s=int(s) if s is not None else None,
                         e=int(e) if e is not None else None)
 
     # --- Overlay zeichnen ---
     overlay = img_bgr.copy()
-    # Marker + Marker-Achse
+    # Marker + Marker-Achse (grün)
     cv2.circle(overlay, (x1, y1), 6, (0, 255, 0), 2)
     cv2.circle(overlay, (x2, y2), 6, (0, 255, 0), 2)
     cv2.line(overlay, (x1, y1), (x2, y2), (0, 200, 0), 2)
 
     thickness = None
     if best["len"] > 0 and best["s"] is not None:
-        x = int(round(best["cx"]))
-        y_start = int(round(best["y0"] + best["s"]))
-        y_end   = int(round(best["y0"] + best["e"] - 1))
-        h = gray.shape[0]
-        y_start = int(np.clip(y_start, 0, h - 1))
-        y_end   = int(np.clip(y_end,   0, h - 1))
+        # Endpunkte entlang der Orthogonalen rekonstruieren
+        nvec = perp / (np.linalg.norm(perp) + 1e-8)
+
+        # Index → t-Abbildung: Index 0 = -L/2, Index (profile_len-1) = +L/2
+        def idx_to_t(idx):
+            return (idx / (profile_len - 1) - 0.5) * profile_len
+
+        t0 = idx_to_t(best["s"])
+        t1 = idx_to_t(best["e"] - 1)
+
+        p0 = (best["cx"] + nvec[0]*t0, best["cy"] + nvec[1]*t0)
+        p1 = (best["cx"] + nvec[0]*t1, best["cy"] + nvec[1]*t1)
+
+        p0_i = (int(np.clip(round(p0[0]), 0, gray.shape[1]-1)),
+                int(np.clip(round(p0[1]), 0, gray.shape[0]-1)))
+        p1_i = (int(np.clip(round(p1[0]), 0, gray.shape[1]-1)),
+                int(np.clip(round(p1[1]), 0, gray.shape[0]-1)))
 
         thickness = int(best["len"])
         # Messstrich NUR über das EHT (BGR: (255,0,0) = Blau)
-        cv2.line(overlay, (x, y_start), (x, y_end), (255, 0, 0), 2)
+        cv2.line(overlay, p0_i, p1_i, (255, 0, 0), 2)
 
     # --- Text oben links (nur mm) ---
     len_mm = px_to_mm(eht_length_px)
@@ -182,7 +221,7 @@ def find_eht_thickness_and_length_from_image(img_bgr, threshold=80, search_range
     return thickness, eht_length_px, overlay
 
 
-def analyze_video(video_path, threshold=80, search_range=80, profile_fraction=0.7, num_samples=300, max_seconds=7):
+def analyze_video(video_path, threshold=80, search_range=80, profile_fraction=0.7, num_samples=300, max_seconds=7, output_dir="output", per_video_subfolder=True):
     """
     Durchläuft ein Video, misst pro Frame die Dicke (min/max + Overlays) und ermittelt die Median-Länge.
     Rückgabe: (min_thick_px:int|None, max_thick_px:int|None, median_len_px:int|None, min_file:str|None, max_file:str|None)
@@ -197,6 +236,9 @@ def analyze_video(video_path, threshold=80, search_range=80, profile_fraction=0.
     max_frames = int(fps * max_seconds)
 
     base = os.path.splitext(os.path.basename(video_path))[0]
+    # Zielordner vorbereiten
+    target_dir = os.path.join(output_dir, base) if per_video_subfolder else output_dir
+    os.makedirs(target_dir, exist_ok=True)
     min_thick, max_thick = None, None
     min_frame_file, max_frame_file = None, None
     lengths = []
@@ -220,11 +262,11 @@ def analyze_video(video_path, threshold=80, search_range=80, profile_fraction=0.
         if thickness is not None:
             if (min_thick is None) or (thickness < min_thick):
                 min_thick = int(thickness)
-                min_frame_file = f"{base}_min_overlay.png"
+                min_frame_file = os.path.join(target_dir, f"{base}_min_overlay.png")
                 cv2.imwrite(min_frame_file, overlay if overlay is not None else frame)
             if (max_thick is None) or (thickness > max_thick):
                 max_thick = int(thickness)
-                max_frame_file = f"{base}_max_overlay.png"
+                max_frame_file = os.path.join(target_dir, f"{base}_max_overlay.png")
                 cv2.imwrite(max_frame_file, overlay if overlay is not None else frame)
 
         frame_idx += 1
@@ -241,6 +283,9 @@ def analyze_video(video_path, threshold=80, search_range=80, profile_fraction=0.
 if __name__ == "__main__":
     print(f"Kalibrierung: {CALIB_PX:.0f} px = {CALIB_MM:.3f} mm  (=> {MM_PER_PX:.5f} mm/px)")
 
+    # Ausgabeordner anlegen
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
     folder_path = FOLDER_PATH
     video_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path)
                    if f.lower().endswith(('.avi', '.mp4', '.mov', '.mkv'))]
@@ -254,7 +299,9 @@ if __name__ == "__main__":
             search_range=SEARCH_RANGE,
             profile_fraction=PROFILE_FRACTION,
             num_samples=NUM_SAMPLES,
-            max_seconds=MAX_SECONDS
+            max_seconds=MAX_SECONDS,
+            output_dir=OUTPUT_DIR,
+            per_video_subfolder=PER_VIDEO_SUBFOLDER
         )
 
         # px → mm umrechnen
@@ -272,7 +319,8 @@ if __name__ == "__main__":
         ])
 
     # CSV speichern (mit zusätzlichen mm-Spalten)
-    with open('EHT_analysis_results_mm.csv', 'w', newline='') as csvfile:
+    csv_path = os.path.join(OUTPUT_DIR, 'EHT_analysis_results_mm.csv')
+    with open(csv_path, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerow([
             'Video',
@@ -283,4 +331,4 @@ if __name__ == "__main__":
         ])
         writer.writerows(results)
 
-    print("Fertig. Ergebnisse in 'EHT_analysis_results_mm.csv'. Overlays zeigen nur mm.")
+    print(f"Fertig. Ergebnisse in '{csv_path}'. Overlays in '{OUTPUT_DIR}' (pro Video ggf. eigener Unterordner). Overlays zeigen nur mm.")
