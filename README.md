@@ -1,6 +1,6 @@
 # EHT Width Analysis – Installation & Usage Guide (VS Code friendly)
 
-This repository contains a Python script that quantifies **minimum (relaxed)** and **maximum (contracted)** thickness of **Engineered Heart Tissues (EHTs)** from **video recordings** (DYNAQUBE-style) by detecting **two red fiducial markers** and sampling a perpendicular intensity profile through the tissue.
+This repository contains a Python script that quantifies **minimum (relaxed)** and **maximum (contracted)** thickness of **Engineered Heart Tissues (EHTs)** from **video recordings** (DYNAQUBE) by detecting **two red fiducial markers** and sampling a perpendicular intensity profile through the tissue.
 
 > **Input expectation:** Standard **video files** (e.g., `.mp4`, `.avi`). This only works with DYNAQUBE videos!
 
